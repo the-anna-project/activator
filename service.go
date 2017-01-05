@@ -201,7 +201,7 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 	{
 		actions := []func(canceler <-chan struct{}) error{
 			func(canceler <-chan struct{}) error {
-				newSignal, newQueue, err = s.WithConfiguration(ctx, signal, queue)
+				newSignal, newQueue, err = s.WithStoredConfigs(ctx, signal, queue)
 				if IsNotFound(err) {
 					return nil
 				} else if err != nil {
@@ -211,7 +211,7 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 				return nil
 			},
 			func(canceler <-chan struct{}) error {
-				newSignal, newQueue, err = s.WithInputTypes(ctx, signal, queue)
+				newSignal, newQueue, err = s.WithQueuedSignals(ctx, signal, queue)
 				if IsNotFound(err) {
 					return nil
 				} else if err != nil {
@@ -266,7 +266,7 @@ func (s *service) Shutdown() {
 	})
 }
 
-func (s *service) WithConfiguration(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
+func (s *service) WithStoredConfigs(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
 	var err error
 
 	// Fetch the combinations of successful behaviour IDs which are known to be
@@ -331,7 +331,7 @@ func (s *service) WithConfiguration(ctx context.Context, signal event.Signal, qu
 	return newSignal, newQueue, nil
 }
 
-func (s *service) WithInputTypes(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
+func (s *service) WithQueuedSignals(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
 	var err error
 
 	// Get the input types of the requested CLG to find out which signals we need

@@ -13,8 +13,8 @@ type Service interface {
 	// requested CLG should be activated. Activation algorithms are provided by
 	// the following functions.
 	//
-	//     Service.WithConfiguration
-	//     Service.WithInputTypes
+	//     Service.WithStoredConfigs
+	//     Service.WithQueuedSignals
 	//
 	// The provided context is scoped to the internals of the execution process of
 	// the current CLG. It does not have anything to do with an event context.
@@ -26,7 +26,7 @@ type Service interface {
 	// call to Boot blocks until the service is completely initialized, so you
 	// might want to call it in a separate goroutine.
 	Boot()
-	// WithConfiguration compares the given queue against the stored configuration
+	// WithStoredConfigs compares the given queue against the stored configuration
 	// of the requested CLG. This configuration is a combination of behaviour IDs
 	// that are known to be successful in combination. In case the given signal
 	// queue contains signals sent by the CLGs listed in the stored configuration,
@@ -41,8 +41,8 @@ type Service interface {
 	//
 	// The provided signal is the current signal being used to activate the
 	// current CLG.
-	WithConfiguration(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error)
-	// WithInputTypes uses the given queue to find a combination of arguments
+	WithStoredConfigs(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error)
+	// WithQueuedSignals uses the given queue to find a combination of arguments
 	// carried by the queue's signals, which fulfills the interface of the
 	// requested CLG. The creation process of Permute may be random or biased in
 	// some way. In case some combination of arguments fulfills the interface of
@@ -60,7 +60,7 @@ type Service interface {
 	//
 	// The provided signal is the current signal being used to activate the
 	// current CLG.
-	WithInputTypes(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error)
+	WithQueuedSignals(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error)
 	// Shutdown ends all processes of the service like shutting down a machine.
 	// The call to Shutdown blocks until the service is completely shut down, so
 	// you might want to call it in a separate goroutine.
