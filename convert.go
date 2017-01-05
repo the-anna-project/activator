@@ -7,15 +7,39 @@ import (
 	"github.com/the-anna-project/event"
 )
 
+func eventsToSignals(events []event.Event) ([]event.Signal, error) {
+	var signals []event.Signal
+
+	for _, e := range events {
+		s, err := event.NewSignalFromEvent(e)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+		signals = append(signals, s)
+	}
+
+	return signals, nil
+}
+
 // queueToValues parses a list of signals to permutation values.
 func queueToValues(queue []event.Signal) []interface{} {
 	var values []interface{}
 
-	for _, p := range queue {
-		values = append(values, p)
+	for _, s := range queue {
+		values = append(values, s)
 	}
 
 	return values
+}
+
+func signalsToEvents(queue []event.Signal) []event.Event {
+	var events []event.Event
+
+	for _, s := range queue {
+		events = append(events, s.(event.Event))
+	}
+
+	return events
 }
 
 // valuesToArgumentTypes parses permutation values to a list of strings
@@ -43,7 +67,7 @@ func valuesToArgumentTypes(values []interface{}) ([]string, error) {
 		}
 	}
 
-	return strings
+	return strings, nil
 }
 
 // valuesToQueue parses permutation values to signal events. The underlying type
@@ -60,7 +84,7 @@ func valuesToQueue(values []interface{}) ([]event.Signal, error) {
 		queue = append(queue, signal)
 	}
 
-	return queue
+	return queue, nil
 }
 
 // valuesToSourceIDs parses permutation values to a list of strings representing
@@ -83,5 +107,5 @@ func valuesToSourceIDs(values []interface{}) ([]string, error) {
 		}
 	}
 
-	return strings
+	return strings, nil
 }

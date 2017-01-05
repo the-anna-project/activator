@@ -7,6 +7,7 @@ import (
 	"github.com/the-anna-project/context"
 	currentbehaviourid "github.com/the-anna-project/context/current/behaviour/id"
 	currentbehaviourinputtypes "github.com/the-anna-project/context/current/behaviour/input/types"
+	sourceids "github.com/the-anna-project/context/source/ids"
 	"github.com/the-anna-project/event"
 	"github.com/the-anna-project/instrumentor"
 	"github.com/the-anna-project/permutation"
@@ -80,7 +81,6 @@ func DefaultServiceConfig() ServiceConfig {
 		InstrumentorCollection: instrumentorCollection,
 		PermutationService:     permutationService,
 		RandomService:          randomService,
-		StorageCollection:      storageCollection,
 		WorkerService:          workerService,
 	}
 
@@ -140,6 +140,11 @@ type service struct {
 func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Signal, error) {
 	var err error
 
+	currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
+	if !ok {
+		return nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
+	}
+
 	// TODO when a signal matches the current behaviour's input types on its own,
 	// even if the CLG does not have any input types, this single signal should be
 	// prefered.
@@ -149,11 +154,7 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 	{
 		// At first we add the current signal to the namespaced queue for the current
 		// CLG, which is managed by the activator.
-		currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
-		if !ok {
-			return nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
-		}
-		err = s.event.Activator.Create(s.queuedNamespace(currentBehaviourID), signal)
+		err = s.event.Activator.Create(signal, currentBehaviourID)
 		if err != nil {
 			return nil, maskAny(err)
 		}
@@ -169,14 +170,19 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 			return nil, maskAnyf(invalidContextError, "current behaviour input types must not be empty")
 		}
 		queueBuffer := len(currentBehaviourInputTypes) + 1
-		err := s.event.Activator.Limit(s.queuedNamespace(currentBehaviourID), queueBuffer)
+		err := s.event.Activator.Limit(queueBuffer, currentBehaviourID)
 		if err != nil {
 			return nil, maskAny(err)
 		}
 
 		// We prepared the signal queue of the current CLG and can fetch all its
 		// signals to process its activation.
-		queue, err = s.event.Activator.SearchAll(currentBehaviourID)
+		events, err := s.event.Activator.SearchAll(currentBehaviourID)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+
+		queue, err = eventsToSignals(events)
 		if err != nil {
 			return nil, maskAny(err)
 		}
@@ -197,8 +203,8 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 	{
 		actions := []func(canceler <-chan struct{}) error{
 			func(canceler <-chan struct{}) error {
-				newSignal, newQueue, err = s.Search(ctx, signal, queue)
-				if IsSignalNotFound(err) {
+				newSignal, newQueue, err = s.WithConfiguration(ctx, signal, queue)
+				if IsNotFound(err) {
 					return nil
 				} else if err != nil {
 					return maskAny(err)
@@ -207,8 +213,8 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 				return nil
 			},
 			func(canceler <-chan struct{}) error {
-				newSignal, newQueue, err = s.Permute(ctx, signal, queue)
-				if IsSignalNotFound(err) {
+				newSignal, newQueue, err = s.WithInputTypes(ctx, signal, queue)
+				if IsNotFound(err) {
 					return nil
 				} else if err != nil {
 					return maskAny(err)
@@ -224,12 +230,13 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		executeConfig.NumWorkers = len(actions)
 		err := s.worker.Execute(executeConfig)
 		if err != nil {
-			return maskAny(err)
+			return nil, maskAny(err)
 		}
 	}
 
 	// Update the modified queue.
-	err = s.event.Activator.Update(currentBehaviourID, newQueue...)
+	events := signalsToEvents(newQueue)
+	err = s.event.Activator.WriteAll(events, currentBehaviourID)
 	if err != nil {
 		return nil, maskAny(err)
 	}
@@ -252,21 +259,23 @@ func (s *service) Shutdown() {
 func (s *service) WithConfiguration(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
 	var err error
 
+	// Fetch the combinations of successful behaviour IDs which are known to be
+	// useful for the activation of the requested CLG. The signals sent by the
+	// CLGs being fetched here are known to be useful because they have already
+	// been helpful for the execution of the current CLG in former CLG tree
+	// executions.
+	//
+	// NOTE that we abuse the event service here for our configuration purposes.
+	// There should be some decent configuration service in the future.
 	var desiredBehaviourIDs [][]string
 	{
-		// Fetch the combination of successful behaviour IDs which are known to be
-		// useful for the activation of the requested CLG. The network payloads sent
-		// by the CLGs being fetched here are known to be useful because they have
-		// already been helpful for the execution of the current CLG tree.
 		currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
 		if !ok {
 			return nil, nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
 		}
-		events, err := s.event.Activator.SearchAll(s.successfulNamespace(currentBehaviourID))
+		events, err := s.event.Activator.SearchAll(currentBehaviourID)
 		if event.IsNotFound(err) {
-			// No successful combination of behaviour IDs is stored. Thus we return an
-			// error.
-			return nil, nil, maskAny(signalNotFoundError)
+			return nil, nil, maskAnyf(notFoundError, "activation configuration")
 		} else if err != nil {
 			return nil, nil, maskAny(err)
 		}
@@ -275,29 +284,35 @@ func (s *service) WithConfiguration(ctx context.Context, signal event.Signal, qu
 		}
 	}
 
-	// TODO check comments below again
-
-	// Check if there is a queued signal for each behaviour ID we found in the
-	// event queue. Here it is important to obtain the order of the behaviour IDs.
-	// They represent the input interface of the requested CLG.
-
-	// Permute the permutation list of the queued signals until we find all the
-	// combinations satisfying the interface of the requested CLG.
+	// At this point we know some configurations for the requested CLG. Now we
+	// have to find the combinations of queued signals that match the
+	// configurations of the found desired behaviour IDs.
 	var possibleMatches [][]event.Signal
 	{
 		for _, idList := range desiredBehaviourIDs {
 			matches, err := s.matchPermutations(queue, idList, len(idList), len(idList), valuesToSourceIDs)
-			if err != nil {
+			if IsNotFound(err) {
+				continue
+			} else if err != nil {
 				return nil, nil, maskAny(err)
 			}
-			possibleMatches = append(possibleMatches, matches)
+			possibleMatches = append(possibleMatches, matches...)
+		}
+
+		if len(possibleMatches) == 0 {
+			return nil, nil, maskAnyf(notFoundError, "activation combination")
 		}
 	}
 
+	// Now we have a list of signals which can be used to activate the requested
+	// CLG. When we have multiple choices, we have to chose one. The chosen signal
+	// combination has to be merged into one new signal and the signals being
+	// combined to activate the requested CLG have to be removed from the signal
+	// queue.
 	var newSignal event.Signal
 	var newQueue []event.Signal
 	{
-		newSignal, newQueue, err := s.filterMatches(queue, possibleMatches)
+		newSignal, newQueue, err = s.filterMatches(queue, possibleMatches)
 		if err != nil {
 			return nil, nil, maskAny(err)
 		}
@@ -309,10 +324,10 @@ func (s *service) WithConfiguration(ctx context.Context, signal event.Signal, qu
 func (s *service) WithInputTypes(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
 	var err error
 
+	// Get the input types of the requested CLG to find out which signals we need
+	// to activate the requested CLG.
 	var desiredInputTypes []string
 	{
-		// Track the input types of the requested CLG as string slice to have
-		// something that is easily comparable and efficient.
 		var ok bool
 		desiredInputTypes, ok = currentbehaviourinputtypes.FromContext(signal.Context())
 		if !ok {
@@ -320,41 +335,57 @@ func (s *service) WithInputTypes(ctx context.Context, signal event.Signal, queue
 		}
 	}
 
-	// TODO check comment
-	// TODO check errors when there are no combinations found
-
+	// At this point we know the input interface of the requested CLG. Now we have
+	// to find the combinations of queued signals that match this interface.
 	var possibleMatches [][]event.Signal
 	{
-		// Permute the permutation list of the queued signals until we find all the
-		// combinations satisfying the interface of the requested CLG.
-		possibleMatches, err = s.matchPermutations(queue, desiredInputTypes, len(idList), 1, valuesToArgumentTypes)
-		if err != nil {
+		possibleMatches, err = s.matchPermutations(queue, desiredInputTypes, len(desiredInputTypes), 1, valuesToArgumentTypes)
+		if IsNotFound(err) {
+			return nil, nil, maskAnyf(notFoundError, "activation combination")
+		} else if err != nil {
 			return nil, nil, maskAny(err)
 		}
 	}
 
+	// Now we have a list of signals which can be used to activate the requested
+	// CLG. When we have multiple choices, we have to chose one. The chosen signal
+	// combination has to be merged into one new signal and the signals being
+	// combined to activate the requested CLG have to be removed from the signal
+	// queue.
 	var newSignal event.Signal
 	var newQueue []event.Signal
 	{
-		newSignal, newQueue, err := s.filterMatches(queue, possibleMatches)
+		newSignal, newQueue, err = s.filterMatches(queue, possibleMatches)
 		if err != nil {
 			return nil, nil, maskAny(err)
 		}
 	}
 
+	// At last step we have to persists the source ID combination which resulted
+	// out of the permuted signals above. The new signal's contect holds these
+	// information. We create a new event and apply the list of source IDs as
+	// configuration to the event's payload. Note that the order of the behaviour
+	// IDs must be preserved, because it reflects the input interface of the
+	// requested CLG.
+	//
+	// NOTE that we abuse the event service here for our configuration purposes.
+	// There should be some decent configuration service in the future.
 	{
-		// Persists the combination of permuted signals as configuration for the
-		// requested CLG. This configuration is stored using references of the
-		// behaviour IDs associated with CLGs that forwarded signals to this requested
-		// CLG. Note that the order of behaviour IDs must be preserved, because it
-		// represents the input interface of the requested CLG.
 		currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
 		if !ok {
 			return nil, nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
 		}
-		// TODO newQueue must be list of events where their payload is a source ID
-		// of the new signal's context each
-		events, err := s.event.Activator.Update(s.successfulNamespace(currentBehaviourID), newQueue)
+		sourceIDs, ok := sourceids.FromContext(newSignal.Context())
+		if !ok {
+			return nil, nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
+		}
+		newConfig := event.DefaultConfig()
+		newConfig.Payload = strings.Join(sourceIDs, ",")
+		newEvent, err := event.New(newConfig)
+		if err != nil {
+			return nil, nil, maskAny(err)
+		}
+		err = s.event.Activator.Create(newEvent, currentBehaviourID)
 		if err != nil {
 			return nil, nil, maskAny(err)
 		}
@@ -364,9 +395,9 @@ func (s *service) WithInputTypes(ctx context.Context, signal event.Signal, queue
 }
 
 func (s *service) filterMatches(queue []event.Signal, matches [][]event.Signal) (event.Signal, []event.Signal, error) {
-	// We fetched all possible combinations of signals that satisfy the interface
-	// of the requested CLG. Now we need to select one random combination to cover
-	// all possible combinations across all possible CLG trees being created over
+	// Here we receive signal combinations that satisfy the interface of the
+	// requested CLG. Now we need to select one random combination to cover all
+	// possible combinations across all possible CLG trees being created over
 	// time. This prevents us from choosing always only the first matching
 	// combination, which would lack discoveries of all potential combinations
 	// being created.
@@ -376,15 +407,15 @@ func (s *service) filterMatches(queue []event.Signal, matches [][]event.Signal) 
 	if err != nil {
 		return nil, nil, maskAny(err)
 	}
-	matches := matches[matchIndex]
+	selected := matches[matchIndex]
 
-	// When we found a new matching list we have to remove the matching signals
+	// When we found a new matching list, we have to remove the matching signals
 	// from the current queue.
-	newQueue := removeSignals(queue, matches)
+	newQueue := removeSignals(queue, selected)
 
 	// We now merge the matching signals to have one new signal that we can return
 	// after queuing the dicsovered combination for the requested CLG.
-	newSignal, err := event.NewSignalFromSignals(matches)
+	newSignal, err := event.NewSignalFromSignals(selected)
 	if err != nil {
 		return nil, nil, maskAny(err)
 	}
@@ -392,15 +423,15 @@ func (s *service) filterMatches(queue []event.Signal, matches [][]event.Signal) 
 	return newSignal, newQueue, nil
 }
 
-// TODO comment
 func (s *service) matchPermutations(queue []event.Signal, desiredList []string, maxGrowth, minGrowth int, converter func([]interface{}) ([]string, error)) ([][]event.Signal, error) {
 	var matches [][]event.Signal
 
-	// TODO check comments
-
-	// Prepare the permutation list to find out which combination of payloads
+	// Prepare the permutation list to find out which combination of signals
 	// satisfies the requested CLG's interface.
-	permutationList := permutation.NewList(permutation.DefaultListConfig())
+	permutationList, err := permutation.NewList(permutation.DefaultListConfig())
+	if err != nil {
+		return nil, maskAny(err)
+	}
 	permutationList.SetMaxGrowth(maxGrowth)
 	permutationList.SetMinGrowth(minGrowth)
 	permutationList.SetRawValues(queueToValues(queue))
@@ -413,6 +444,10 @@ func (s *service) matchPermutations(queue []event.Signal, desiredList []string, 
 		// signals match the interface of the requested CLG, we capture the found
 		// combination and try to find more combinations in the upcoming loops.
 		permutedValues := permutationList.PermutedValues()
+		// The permutation values are actually of type event.Signal. We need a
+		// converter function for different purposes. Different algorithms rely on
+		// different information which have to be aggregated in different ways.
+		// Therefore the injected converter.
 		currentList, err := converter(permutedValues)
 		if err != nil {
 			return nil, maskAny(err)
@@ -429,12 +464,16 @@ func (s *service) matchPermutations(queue []event.Signal, desiredList []string, 
 		// step. As soon as the permutation list cannot be permuted anymore, we stop
 		// the permutation loop to choose one random combination of the tracked list
 		// in the next step below.
-		err := s.permutation.PermuteBy(permutationList, 1)
+		err = s.permutation.PermuteBy(permutationList, 1)
 		if permutation.IsMaxGrowthReached(err) {
 			break
 		} else if err != nil {
 			return nil, maskAny(err)
 		}
+	}
+
+	if len(matches) == 0 {
+		return nil, maskAny(notFoundError)
 	}
 
 	return matches, nil

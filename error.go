@@ -43,9 +43,9 @@ func IsInvalidExecution(err error) bool {
 	return errgo.Cause(err) == invalidExecutionError
 }
 
-var signalNotFoundError = errgo.New("signal not found")
+var notFoundError = errgo.New("not found")
 
-// IsSignalNotFound asserts signalNotFoundError.
-func IsSignalNotFound(err error) bool {
-	return errgo.Cause(err) == signalNotFoundError
+// IsNotFound asserts notFoundError.
+func IsNotFound(err error) bool {
+	return errgo.Cause(err) == notFoundError
 }
