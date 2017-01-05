@@ -140,14 +140,14 @@ type service struct {
 func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Signal, error) {
 	var err error
 
-	currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
-	if !ok {
-		return nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
+	var currentBehaviourID string
+	{
+		var ok bool
+		currentBehaviourID, ok = currentbehaviourid.FromContext(signal.Context())
+		if !ok {
+			return nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
+		}
 	}
-
-	// TODO when a signal matches the current behaviour's input types on its own,
-	// even if the CLG does not have any input types, this single signal should be
-	// prefered.
 
 	// Find the signal queue for the current CLG.
 	var queue []event.Signal
@@ -196,8 +196,6 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 	//
 	// TODO how to identify a specific choice to be successful? This information
 	// has to flow back as soon as we know the CLG tree was successful.
-	//
-	// TODO handle errors and check if signal and queue is empty
 	var newSignal event.Signal
 	var newQueue []event.Signal
 	{
@@ -224,21 +222,33 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 			},
 		}
 
+		errors := make(chan error, len(actions))
+
 		executeConfig := s.worker.ExecuteConfig()
 		executeConfig.Actions = actions
 		executeConfig.Canceler = s.closer
+		executeConfig.Errors = errors
 		executeConfig.NumWorkers = len(actions)
 		err := s.worker.Execute(executeConfig)
-		if err != nil {
+		if allNotFound(errors) {
+			// In case there did not any action find any result, we have to give up
+			// and return the error.
+			return nil, maskAny(notFoundError)
+		} else if IsNotFound(err) {
+			// In case there did not all actions result in not found errors, we want
+			// to ignore the errors and use the results we found so far.
+		} else if err != nil {
 			return nil, maskAny(err)
 		}
 	}
 
 	// Update the modified queue.
-	events := signalsToEvents(newQueue)
-	err = s.event.Activator.WriteAll(events, currentBehaviourID)
-	if err != nil {
-		return nil, maskAny(err)
+	{
+		events := signalsToEvents(newQueue)
+		err = s.event.Activator.WriteAll(events, currentBehaviourID)
+		if err != nil {
+			return nil, maskAny(err)
+		}
 	}
 
 	return newSignal, nil

@@ -10,6 +10,16 @@ var (
 	maskAny = errgo.MaskFunc(errgo.Any)
 )
 
+func allNotFound(errors chan error) bool {
+	for err := range errors {
+		if !IsNotFound(err) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func maskAnyf(err error, f string, v ...interface{}) error {
 	if err == nil {
 		return nil

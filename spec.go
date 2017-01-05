@@ -13,8 +13,8 @@ type Service interface {
 	// requested CLG should be activated. Activation algorithms are provided by
 	// the following functions.
 	//
-	//     Service.ByConfiguration
-	//     Service.ByInputTypes
+	//     Service.WithConfiguration
+	//     Service.WithInputTypes
 	//
 	// The provided context is scoped to the internals of the execution process of
 	// the current CLG. It does not have anything to do with an event context.
