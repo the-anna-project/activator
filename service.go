@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/the-anna-project/configuration"
 	"github.com/the-anna-project/context"
 	currentbehaviourid "github.com/the-anna-project/context/current/behaviour/id"
 	currentbehaviourinputtypes "github.com/the-anna-project/context/current/behaviour/input/types"
@@ -18,6 +19,7 @@ import (
 // ServiceConfig represents the configuration used to create a new CLG service.
 type ServiceConfig struct {
 	// Dependencies.
+	ConfigurationService   configuration.Service
 	EventCollection        *event.Collection
 	InstrumentorCollection *instrumentor.Collection
 	PermutationService     permutation.Service
@@ -29,6 +31,15 @@ type ServiceConfig struct {
 // service by best effort.
 func DefaultServiceConfig() ServiceConfig {
 	var err error
+
+	var configurationService configuration.Service
+	{
+		configurationConfig := configuration.DefaultServiceConfig()
+		configurationService, err = configuration.NewService(configurationConfig)
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	var eventCollection *event.Collection
 	{
@@ -77,6 +88,7 @@ func DefaultServiceConfig() ServiceConfig {
 
 	config := ServiceConfig{
 		// Dependencies.
+		ConfigurationService:   configurationService,
 		EventCollection:        eventCollection,
 		InstrumentorCollection: instrumentorCollection,
 		PermutationService:     permutationService,
@@ -90,6 +102,9 @@ func DefaultServiceConfig() ServiceConfig {
 // NewService creates a new configured CLG service.
 func NewService(config ServiceConfig) (Service, error) {
 	// Dependencies.
+	if config.ConfigurationService == nil {
+		return nil, maskAnyf(invalidConfigError, "configuration service must not be empty")
+	}
 	if config.EventCollection == nil {
 		return nil, maskAnyf(invalidConfigError, "event collection must not be empty")
 	}
@@ -108,11 +123,12 @@ func NewService(config ServiceConfig) (Service, error) {
 
 	newService := &service{
 		// Dependencies.
-		event:        config.EventCollection,
-		instrumentor: config.InstrumentorCollection,
-		permutation:  config.PermutationService,
-		random:       config.RandomService,
-		worker:       config.WorkerService,
+		configuration: config.ConfigurationService,
+		event:         config.EventCollection,
+		instrumentor:  config.InstrumentorCollection,
+		permutation:   config.PermutationService,
+		random:        config.RandomService,
+		worker:        config.WorkerService,
 
 		// Internals.
 		bootOnce:     sync.Once{},
@@ -125,11 +141,12 @@ func NewService(config ServiceConfig) (Service, error) {
 
 type service struct {
 	// Dependencies.
-	event        *event.Collection
-	instrumentor *instrumentor.Collection
-	permutation  permutation.Service
-	random       random.Service
-	worker       worker.Service
+	configuration configuration.Service
+	event         *event.Collection
+	instrumentor  *instrumentor.Collection
+	permutation   permutation.Service
+	random        random.Service
+	worker        worker.Service
 
 	// Internals.
 	bootOnce     sync.Once
@@ -188,42 +205,43 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		}
 	}
 
-	// Create a new signal.
-	//
-	// TODO we have to synchronise the assigning process of the variables below.
-	// At first we should choose random candidates for the actual usage. Further
-	// we have to emit metrics about the used choice.
-	//
-	// TODO how to identify a specific choice to be successful? This information
-	// has to flow back as soon as we know the CLG tree was successful.
-	var newSignal event.Signal
-	var newQueue []event.Signal
+	// We have to synchronise the assigning process of the calculated results
+	// below. To do so we make use of the configuration service which also aims to
+	// learn from the experiences it makes over time.
+	var profile configuration.Profile
+	{
+		config := s.configuration.ProfileConfig()
+		config.SetLabels(currentBehaviourID, ConfigurationKey)
+		profile, err = s.configuration.Profile(ctx, config)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+	}
+
+	// Execute the activation rule actions.
 	{
 		actions := []func(canceler <-chan struct{}) error{
 			func(canceler <-chan struct{}) error {
 				newSignal, newQueue, err = s.WithStoredConfigs(ctx, signal, queue)
-				if IsNotFound(err) {
-					return nil
-				} else if err != nil {
+				if err != nil {
 					return maskAny(err)
 				}
+				profile.Add(WithStoredConfigsKey, newSignal, newQueue)
 
 				return nil
 			},
 			func(canceler <-chan struct{}) error {
 				newSignal, newQueue, err = s.WithQueuedSignals(ctx, signal, queue)
-				if IsNotFound(err) {
-					return nil
-				} else if err != nil {
+				if err != nil {
 					return maskAny(err)
 				}
+				profile.Add(WithQueuedSignalsKey, newSignal, newQueue)
 
 				return nil
 			},
 		}
 
 		errors := make(chan error, len(actions))
-
 		executeConfig := s.worker.ExecuteConfig()
 		executeConfig.Actions = actions
 		executeConfig.Canceler = s.closer
@@ -233,11 +251,29 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		if allNotFound(errors) {
 			// In case there did not any action find any result, we have to give up
 			// and return the error.
-			return nil, maskAny(notFoundError)
+			return nil, maskAnyf(notFoundError, "activation configuration")
 		} else if IsNotFound(err) {
 			// In case there did not all actions result in not found errors, we want
 			// to ignore the errors and use the results we found so far.
 		} else if err != nil {
+			return nil, maskAny(err)
+		}
+	}
+
+	// Fetch the actual results from the exexuted actions above.
+	var newSignal event.Signal
+	var newQueue []event.Signal
+	{
+		key, results, err := profile.Get()
+		if err != nil {
+			return nil, maskAny(err)
+		}
+		newSignal, err = resultsToSignalWithIndex(results, 0)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+		newQueue, err = resultsToQueueWithIndex(results, 1)
+		if err != nil {
 			return nil, maskAny(err)
 		}
 	}
@@ -413,6 +449,7 @@ func (s *service) filterMatches(queue []event.Signal, matches [][]event.Signal) 
 	// being created.
 	//
 	// TODO emit metrics about the decisions and successes/failures we make here.
+	// TODO we should rather use the configuration service for this.
 	matchIndex, err := s.random.CreateMax(len(matches))
 	if err != nil {
 		return nil, nil, maskAny(err)
