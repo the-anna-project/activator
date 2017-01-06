@@ -32,6 +32,37 @@ func queueToValues(queue []event.Signal) []interface{} {
 	return values
 }
 
+func resultsToQueueWithIndex(results []interface{}, index int) ([]event.Signal, error) {
+	if len(results) >= index || index < 0 {
+		return nil, maskAnyf(invalidExecutionError, "index out of range")
+	}
+
+	var queue []event.Signal
+
+	for _, v := range values {
+		signal, ok := v.(event.Signal)
+		if !ok {
+			return nil, maskAnyf(invalidExecutionError, "result must be event signal")
+		}
+		queue = append(queue, signal)
+	}
+
+	return queue, nil
+}
+
+func resultsToSignalWithIndex(results []interface{}, index int) (event.Signal, error) {
+	if len(results) >= index || index < 0 {
+		return nil, maskAnyf(invalidExecutionError, "index out of range")
+	}
+
+	signal, ok := results[index].(event.Signal)
+	if !ok {
+		return nil, maskAnyf(invalidExecutionError, "result must be event signal")
+	}
+
+	return signal, nil
+}
+
 func signalsToEvents(queue []event.Signal) []event.Event {
 	var events []event.Event
 
