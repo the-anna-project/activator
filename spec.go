@@ -9,7 +9,14 @@ import (
 // activator obtains signals for every single requested CLG within every
 // possible CLG tree.
 type Service interface {
-	// Activate applies different activation algorithms to check whether the
+	// Boot initializes and starts the whole service like booting a machine. The
+	// call to Boot blocks until the service is completely initialized, so you
+	// might want to call it in a separate goroutine.
+	Boot()
+	// Execute implements the success stage of the service. Here trial and replay
+	// routines in context to the service's business logic are implemented.
+	//
+	// Execute applies different activation algorithms to check whether the
 	// requested CLG should be activated. Activation algorithms are provided by
 	// the following functions.
 	//
@@ -21,11 +28,11 @@ type Service interface {
 	//
 	// The provided signal is the current signal being used to activate the
 	// current CLG.
-	Activate(ctx context.Context, signal event.Signal) (event.Signal, error)
-	// Boot initializes and starts the whole service like booting a machine. The
-	// call to Boot blocks until the service is completely initialized, so you
-	// might want to call it in a separate goroutine.
-	Boot()
+	Execute(ctx context.Context, signal event.Signal) (event.Signal, error)
+	// Failure implements the success stage of the service. Here statistical
+	// records can be tracked. Further all state, but statistical records generate
+	// during the execute stage, will be prurged.
+	Failure(ctx context.Context, signal event.Signal) error
 	// WithStoredConfigs compares the given queue against the stored configuration
 	// of the requested CLG. This configuration is a combination of behaviour IDs
 	// that are known to be successful in combination. In case the given signal
@@ -65,4 +72,7 @@ type Service interface {
 	// The call to Shutdown blocks until the service is completely shut down, so
 	// you might want to call it in a separate goroutine.
 	Shutdown()
+	// Success implements the success stage of the service. Here statistical
+	// records can be tracked.
+	Success(ctx context.Context, signal event.Signal) error
 }

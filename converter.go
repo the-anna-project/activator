@@ -3,7 +3,7 @@ package activator
 import (
 	"reflect"
 
-	sourceids "github.com/the-anna-project/context/source/ids"
+	currentsource "github.com/the-anna-project/context/current/source"
 	"github.com/the-anna-project/event"
 )
 
@@ -37,14 +37,9 @@ func resultsToQueueWithIndex(results []interface{}, index int) ([]event.Signal, 
 		return nil, maskAnyf(invalidExecutionError, "index out of range")
 	}
 
-	var queue []event.Signal
-
-	for _, v := range values {
-		signal, ok := v.(event.Signal)
-		if !ok {
-			return nil, maskAnyf(invalidExecutionError, "result must be event signal")
-		}
-		queue = append(queue, signal)
+	queue, ok := results[index].([]event.Signal)
+	if !ok {
+		return nil, maskAnyf(invalidExecutionError, "result must be slice of event signals")
 	}
 
 	return queue, nil
@@ -130,11 +125,11 @@ func valuesToSourceIDs(values []interface{}) ([]string, error) {
 			if !ok {
 				return nil, maskAnyf(invalidExecutionError, "permutation value must be event signal")
 			}
-			sourceIDs, ok := sourceids.FromContext(signal.Context())
+			currentSource, ok := currentsource.FromContext(signal.Context())
 			if !ok {
 				return nil, maskAnyf(invalidContextError, "source ids must not be empty")
 			}
-			strings = append(strings, sourceIDs...)
+			strings = append(strings, currentSource.IDs...)
 		}
 	}
 
