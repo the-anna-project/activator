@@ -4,10 +4,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/the-anna-project/configuration"
 	"github.com/the-anna-project/context"
-	currentbehaviourid "github.com/the-anna-project/context/current/behaviour/id"
-	currentbehaviourinputtypes "github.com/the-anna-project/context/current/behaviour/input/types"
-	sourceids "github.com/the-anna-project/context/source/ids"
+	currentbehaviour "github.com/the-anna-project/context/current/behaviour"
+	currentsource "github.com/the-anna-project/context/current/source"
 	"github.com/the-anna-project/event"
 	"github.com/the-anna-project/instrumentor"
 	"github.com/the-anna-project/permutation"
@@ -15,9 +15,16 @@ import (
 	"github.com/the-anna-project/worker"
 )
 
+var (
+	configurationKey     = "activator/configuration"
+	withStoredConfigsKey = "activator/with-stored-configs"
+	withQueuedSignalsKey = "activator/with-queued-signals"
+)
+
 // ServiceConfig represents the configuration used to create a new CLG service.
 type ServiceConfig struct {
 	// Dependencies.
+	ConfigurationService   configuration.Service
 	EventCollection        *event.Collection
 	InstrumentorCollection *instrumentor.Collection
 	PermutationService     permutation.Service
@@ -29,6 +36,15 @@ type ServiceConfig struct {
 // service by best effort.
 func DefaultServiceConfig() ServiceConfig {
 	var err error
+
+	var configurationService configuration.Service
+	{
+		configurationConfig := configuration.DefaultServiceConfig()
+		configurationService, err = configuration.NewService(configurationConfig)
+		if err != nil {
+			panic(err)
+		}
+	}
 
 	var eventCollection *event.Collection
 	{
@@ -77,6 +93,7 @@ func DefaultServiceConfig() ServiceConfig {
 
 	config := ServiceConfig{
 		// Dependencies.
+		ConfigurationService:   configurationService,
 		EventCollection:        eventCollection,
 		InstrumentorCollection: instrumentorCollection,
 		PermutationService:     permutationService,
@@ -90,6 +107,9 @@ func DefaultServiceConfig() ServiceConfig {
 // NewService creates a new configured CLG service.
 func NewService(config ServiceConfig) (Service, error) {
 	// Dependencies.
+	if config.ConfigurationService == nil {
+		return nil, maskAnyf(invalidConfigError, "configuration service must not be empty")
+	}
 	if config.EventCollection == nil {
 		return nil, maskAnyf(invalidConfigError, "event collection must not be empty")
 	}
@@ -108,11 +128,12 @@ func NewService(config ServiceConfig) (Service, error) {
 
 	newService := &service{
 		// Dependencies.
-		event:        config.EventCollection,
-		instrumentor: config.InstrumentorCollection,
-		permutation:  config.PermutationService,
-		random:       config.RandomService,
-		worker:       config.WorkerService,
+		configuration: config.ConfigurationService,
+		event:         config.EventCollection,
+		instrumentor:  config.InstrumentorCollection,
+		permutation:   config.PermutationService,
+		random:        config.RandomService,
+		worker:        config.WorkerService,
 
 		// Internals.
 		bootOnce:     sync.Once{},
@@ -125,11 +146,12 @@ func NewService(config ServiceConfig) (Service, error) {
 
 type service struct {
 	// Dependencies.
-	event        *event.Collection
-	instrumentor *instrumentor.Collection
-	permutation  permutation.Service
-	random       random.Service
-	worker       worker.Service
+	configuration configuration.Service
+	event         *event.Collection
+	instrumentor  *instrumentor.Collection
+	permutation   permutation.Service
+	random        random.Service
+	worker        worker.Service
 
 	// Internals.
 	bootOnce     sync.Once
@@ -137,15 +159,21 @@ type service struct {
 	shutdownOnce sync.Once
 }
 
-func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Signal, error) {
+func (s *service) Boot() {
+	s.bootOnce.Do(func() {
+		// Service specific boot logic goes here.
+	})
+}
+
+func (s *service) Execute(ctx context.Context, signal event.Signal) (event.Signal, error) {
 	var err error
 
-	var currentBehaviourID string
+	var currentBehaviour currentbehaviour.Value
 	{
 		var ok bool
-		currentBehaviourID, ok = currentbehaviourid.FromContext(signal.Context())
+		currentBehaviour, ok = currentbehaviour.FromContext(signal.Context())
 		if !ok {
-			return nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
+			return nil, maskAnyf(invalidContextError, "current behaviour must not be empty")
 		}
 	}
 
@@ -154,7 +182,7 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 	{
 		// At first we add the current signal to the namespaced queue for the current
 		// CLG, which is managed by the activator.
-		err = s.event.Activator.Create(signal, currentBehaviourID)
+		err = s.event.Activator.Create(ctx, signal, currentBehaviour.ID)
 		if err != nil {
 			return nil, maskAny(err)
 		}
@@ -165,19 +193,15 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		// further. Thus we cut the queue at some point beyond the interface
 		// capabilities of the current CLG. Note that it is possible to have multiple
 		// signals sent from the same source CLG.
-		currentBehaviourInputTypes, ok := currentbehaviourinputtypes.FromContext(signal.Context())
-		if !ok {
-			return nil, maskAnyf(invalidContextError, "current behaviour input types must not be empty")
-		}
-		queueBuffer := len(currentBehaviourInputTypes) + 1
-		err := s.event.Activator.Limit(queueBuffer, currentBehaviourID)
+		queueBuffer := len(currentBehaviour.Input.Types) + 1
+		err := s.event.Activator.Limit(ctx, queueBuffer, currentBehaviour.ID)
 		if err != nil {
 			return nil, maskAny(err)
 		}
 
 		// We prepared the signal queue of the current CLG and can fetch all its
 		// signals to process its activation.
-		events, err := s.event.Activator.SearchAll(currentBehaviourID)
+		events, err := s.event.Activator.SearchAll(ctx, currentBehaviour.ID)
 		if err != nil {
 			return nil, maskAny(err)
 		}
@@ -188,33 +212,44 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		}
 	}
 
-	// Create a new signal.
-	//
-	// TODO we have to synchronise the assigning process of the variables below.
-	// At first we should choose random candidates for the actual usage. Further
-	// we have to emit metrics about the used choice.
-	//
-	// TODO how to identify a specific choice to be successful? This information
-	// has to flow back as soon as we know the CLG tree was successful.
-	var newSignal event.Signal
-	var newQueue []event.Signal
+	// We have to synchronise the assigning process of the calculated results
+	// below. To do so we make use of the configuration service which also aims to
+	// learn from the experiences it makes over time. To leverage the
+	// configuration service, we have to label our setting. The labels used here
+	// scope the configuration to the activator service and the behaviour ID of
+	// the currently requested CLG.
+	var configLabels []string
 	{
-		actions := []func(canceler <-chan struct{}) error{
-			func(canceler <-chan struct{}) error {
-				newSignal, newQueue, err = s.WithStoredConfigs(ctx, signal, queue)
-				if IsNotFound(err) {
-					return nil
-				} else if err != nil {
+		configLabels = []string{
+			configurationKey,
+			currentBehaviour.ID,
+		}
+	}
+
+	// Execute the activation rule actions.
+	{
+		actions := []func(ctx context.Context) error{
+			func(ctx context.Context) error {
+				newSignal, newQueue, err := s.WithStoredConfigs(ctx, signal, queue)
+				if err != nil {
+					return maskAny(err)
+				}
+
+				err = s.configuration.Create(ctx, configLabels, withStoredConfigsKey, []interface{}{newSignal, newQueue})
+				if err != nil {
 					return maskAny(err)
 				}
 
 				return nil
 			},
-			func(canceler <-chan struct{}) error {
-				newSignal, newQueue, err = s.WithQueuedSignals(ctx, signal, queue)
-				if IsNotFound(err) {
-					return nil
-				} else if err != nil {
+			func(ctx context.Context) error {
+				newSignal, newQueue, err := s.WithQueuedSignals(ctx, signal, queue)
+				if err != nil {
+					return maskAny(err)
+				}
+
+				err = s.configuration.Create(ctx, configLabels, withQueuedSignalsKey, []interface{}{newSignal, newQueue})
+				if err != nil {
 					return maskAny(err)
 				}
 
@@ -223,17 +258,15 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		}
 
 		errors := make(chan error, len(actions))
-
 		executeConfig := s.worker.ExecuteConfig()
 		executeConfig.Actions = actions
-		executeConfig.Canceler = s.closer
 		executeConfig.Errors = errors
 		executeConfig.NumWorkers = len(actions)
-		err := s.worker.Execute(executeConfig)
+		err := s.worker.Execute(ctx, executeConfig)
 		if allNotFound(errors) {
 			// In case there did not any action find any result, we have to give up
 			// and return the error.
-			return nil, maskAny(notFoundError)
+			return nil, maskAnyf(notFoundError, "activation configuration")
 		} else if IsNotFound(err) {
 			// In case there did not all actions result in not found errors, we want
 			// to ignore the errors and use the results we found so far.
@@ -242,10 +275,28 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 		}
 	}
 
+	// Fetch the actual results from the exexuted actions above.
+	var newSignal event.Signal
+	var newQueue []event.Signal
+	{
+		_, results, err := s.configuration.Execute(ctx, configLabels)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+		newSignal, err = resultsToSignalWithIndex(results, 0)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+		newQueue, err = resultsToQueueWithIndex(results, 1)
+		if err != nil {
+			return nil, maskAny(err)
+		}
+	}
+
 	// Update the modified queue.
 	{
 		events := signalsToEvents(newQueue)
-		err = s.event.Activator.WriteAll(events, currentBehaviourID)
+		err = s.event.Activator.WriteAll(ctx, events, currentBehaviour.ID)
 		if err != nil {
 			return nil, maskAny(err)
 		}
@@ -254,16 +305,18 @@ func (s *service) Activate(ctx context.Context, signal event.Signal) (event.Sign
 	return newSignal, nil
 }
 
-func (s *service) Boot() {
-	s.bootOnce.Do(func() {
-		// Service specific boot logic goes here.
-	})
+func (s *service) Failure(ctx context.Context, signal event.Signal) error {
+	return nil
 }
 
 func (s *service) Shutdown() {
 	s.shutdownOnce.Do(func() {
 		close(s.closer)
 	})
+}
+
+func (s *service) Success(ctx context.Context, signal event.Signal) error {
+	return nil
 }
 
 func (s *service) WithStoredConfigs(ctx context.Context, signal event.Signal, queue []event.Signal) (event.Signal, []event.Signal, error) {
@@ -279,11 +332,11 @@ func (s *service) WithStoredConfigs(ctx context.Context, signal event.Signal, qu
 	// There should be some decent configuration service in the future.
 	var desiredBehaviourIDs [][]string
 	{
-		currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
+		currentBehaviour, ok := currentbehaviour.FromContext(signal.Context())
 		if !ok {
-			return nil, nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
+			return nil, nil, maskAnyf(invalidContextError, "current behaviour must not be empty")
 		}
-		events, err := s.event.Activator.SearchAll(currentBehaviourID)
+		events, err := s.event.Activator.SearchAll(ctx, currentBehaviour.ID)
 		if event.IsNotFound(err) {
 			return nil, nil, maskAnyf(notFoundError, "activation configuration")
 		} else if err != nil {
@@ -336,12 +389,12 @@ func (s *service) WithQueuedSignals(ctx context.Context, signal event.Signal, qu
 
 	// Get the input types of the requested CLG to find out which signals we need
 	// to activate the requested CLG.
-	var desiredInputTypes []string
+	var currentBehaviour currentbehaviour.Value
 	{
 		var ok bool
-		desiredInputTypes, ok = currentbehaviourinputtypes.FromContext(signal.Context())
+		currentBehaviour, ok = currentbehaviour.FromContext(signal.Context())
 		if !ok {
-			return nil, nil, maskAnyf(invalidContextError, "current behaviour input types must not be empty")
+			return nil, nil, maskAnyf(invalidContextError, "current behaviour must not be empty")
 		}
 	}
 
@@ -349,7 +402,7 @@ func (s *service) WithQueuedSignals(ctx context.Context, signal event.Signal, qu
 	// to find the combinations of queued signals that match this interface.
 	var possibleMatches [][]event.Signal
 	{
-		possibleMatches, err = s.matchPermutations(queue, desiredInputTypes, len(desiredInputTypes), 1, valuesToArgumentTypes)
+		possibleMatches, err = s.matchPermutations(queue, currentBehaviour.Input.Types, len(currentBehaviour.Input.Types), 1, valuesToArgumentTypes)
 		if IsNotFound(err) {
 			return nil, nil, maskAnyf(notFoundError, "activation combination")
 		} else if err != nil {
@@ -381,21 +434,17 @@ func (s *service) WithQueuedSignals(ctx context.Context, signal event.Signal, qu
 	// NOTE that we abuse the event service here for our configuration purposes.
 	// There should be some decent configuration service in the future.
 	{
-		currentBehaviourID, ok := currentbehaviourid.FromContext(signal.Context())
-		if !ok {
-			return nil, nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
-		}
-		sourceIDs, ok := sourceids.FromContext(newSignal.Context())
+		currentSource, ok := currentsource.FromContext(newSignal.Context())
 		if !ok {
 			return nil, nil, maskAnyf(invalidContextError, "behaviour id must not be empty")
 		}
 		newConfig := event.DefaultConfig()
-		newConfig.Payload = strings.Join(sourceIDs, ",")
+		newConfig.Payload = strings.Join(currentSource.IDs, ",")
 		newEvent, err := event.New(newConfig)
 		if err != nil {
 			return nil, nil, maskAny(err)
 		}
-		err = s.event.Activator.Create(newEvent, currentBehaviourID)
+		err = s.event.Activator.Create(ctx, newEvent, currentBehaviour.ID)
 		if err != nil {
 			return nil, nil, maskAny(err)
 		}
@@ -413,6 +462,7 @@ func (s *service) filterMatches(queue []event.Signal, matches [][]event.Signal) 
 	// being created.
 	//
 	// TODO emit metrics about the decisions and successes/failures we make here.
+	// TODO we should rather use the configuration service for this.
 	matchIndex, err := s.random.CreateMax(len(matches))
 	if err != nil {
 		return nil, nil, maskAny(err)
